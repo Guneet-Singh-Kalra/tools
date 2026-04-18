@@ -3,7 +3,7 @@ README (Quick Start)
 1) cd backend
 2) python -m venv .venv && source .venv/bin/activate
 3) pip install -r requirements.txt
-4) cp .env.example .env and set OPENAI_API_KEY
+4) cp .env.example .env and set GEMINI_API_KEY
 5) uvicorn main:app --reload --port 8000
 
 API docs: http://localhost:8000/docs
