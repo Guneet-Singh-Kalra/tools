@@ -1,6 +1,52 @@
 import React, { useState, useEffect } from 'react';
 import { ShieldAlert, FileText, Upload, AlertTriangle, CheckCircle, Lock, ArrowRight, Zap, Eye } from 'lucide-react';
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+
+const normalizeAnalyzeResponse = (payload, fallbackName) => {
+  const clauses = Array.isArray(payload?.clauses) ? payload.clauses : [];
+  const normalizedClauses = clauses.map((clause, idx) => ({
+    clause_title: clause?.clause_title || `Clause ${idx + 1}`,
+    plain_english: clause?.plain_english || 'No plain-language explanation available.',
+    risk_level: clause?.risk_level || 'Low',
+    risk_score: clause?.risk_score ?? 1,
+    risk_type: clause?.risk_type || 'General',
+    why_risky: clause?.why_risky || 'No specific risk reason provided.',
+    who_it_favors: clause?.who_it_favors || 'Neutral',
+  }));
+
+  const topRedFlags = Array.isArray(payload?.top_red_flags) ? payload.top_red_flags : [];
+
+  return {
+    document_name: payload?.document_name || fallbackName || 'uploaded_document',
+    overall_risk: payload?.overall_risk || 'Low',
+    summary: payload?.summary || 'No summary was returned by the analyzer.',
+    top_red_flags: topRedFlags.length > 0 ? topRedFlags : ['No major red flags detected.'],
+    clauses: normalizedClauses,
+  };
+};
+
+const getClauseRiskTheme = (riskLevel) => {
+  if (riskLevel === 'High') {
+    return {
+      bar: 'bg-gradient-to-r from-red-500 to-red-600',
+      badge: 'bg-red-100 text-red-700',
+    };
+  }
+
+  if (riskLevel === 'Medium') {
+    return {
+      bar: 'bg-gradient-to-r from-amber-400 to-amber-500',
+      badge: 'bg-amber-100 text-amber-700',
+    };
+  }
+
+  return {
+    bar: 'bg-gradient-to-r from-green-500 to-emerald-600',
+    badge: 'bg-green-100 text-green-700',
+  };
+};
+
 const App = () => {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -14,43 +60,52 @@ const App = () => {
   const handleUpload = async () => {
     if (!file) return;
     setLoading(true);
-    
-    setTimeout(() => {
-      setData({
-        "document_name": file.name,
-        "overall_risk": "Medium",
-        "summary": "This contract manages software usage rights. While standard, it contains aggressive data-sharing clauses and a difficult termination process that favors the provider.",
-        "top_red_flags": [
-          "Automatic 12-month renewal without email notice",
-          "Provider can change pricing with only 7 days notice",
-          "Unlimited data harvesting for 'third-party marketing'"
-        ],
-        "clauses": [
-          { 
-            "clause_title": "Section 4.2: Auto-Renewal", 
-            "plain_english": "The contract resets itself every year and charges you automatically.", 
-            "risk_level": "High", 
-            "why_risky": "Requires a 90-day written notice to cancel, otherwise you are locked in for another year.", 
-            "who_it_favors": "Company" 
+    setData(null);
+
+    try {
+      const lowerName = file.name.toLowerCase();
+      const isPdf = lowerName.endsWith('.pdf') || file.type === 'application/pdf';
+      const isTxt = lowerName.endsWith('.txt');
+      let response;
+
+      if (isPdf) {
+        const formData = new FormData();
+        formData.append('file', file);
+
+        response = await fetch(`${API_BASE_URL}/analyze`, {
+          method: 'POST',
+          body: formData,
+        });
+      } else if (isTxt) {
+        const text = await file.text();
+
+        response = await fetch(`${API_BASE_URL}/analyze-text`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
           },
-          { 
-            "clause_title": "Section 8.1: Liability", 
-            "plain_english": "If they lose your data, you can't sue for more than $50.", 
-            "risk_level": "High", 
-            "why_risky": "The cap on damages is extremely low compared to potential data value.", 
-            "who_it_favors": "Company" 
-          },
-          { 
-            "clause_title": "Section 12: Data Privacy", 
-            "plain_english": "They can use your usage stats to improve their own AI models.", 
-            "risk_level": "Low", 
-            "why_risky": "Standard industry practice, though worth noting for sensitive projects.", 
-            "who_it_favors": "Both" 
-          }
-        ]
-      });
+          body: JSON.stringify({
+            document_name: file.name,
+            text,
+          }),
+        });
+      } else {
+        throw new Error('This MVP currently supports PDF upload (and TXT for test input).');
+      }
+
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(result?.detail || 'Failed to analyze document.');
+      }
+
+      setData(normalizeAnalyzeResponse(result, file.name));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Something went wrong while analyzing the document.';
+      window.alert(message);
+      console.error('Document analysis failed:', error);
+    } finally {
       setLoading(false);
-    }, 2800);
+    }
   };
 
   return (
@@ -137,7 +192,7 @@ const App = () => {
                       className="hidden" 
                       id="pdf-upload" 
                       onChange={(e) => setFile(e.target.files[0])}
-                      accept=".pdf,.docx"
+                      accept=".pdf,.docx,.txt"
                     />
                     
                     {!file ? (
@@ -304,16 +359,14 @@ const App = () => {
               </div>
 
               <div className="space-y-5">
-                {data.clauses.map((clause, index) => (
+                {data.clauses.map((clause, index) => {
+                  const clauseTheme = getClauseRiskTheme(clause.risk_level);
+                  return (
                   <div 
                     key={index} 
                     className="group bg-white border border-slate-200 rounded-3xl overflow-hidden shadow-sm hover:shadow-xl hover:border-slate-300 transition-all duration-300"
                   >
-                    <div className={`h-1.5 w-full ${
-                      clause.risk_level === 'High' 
-                        ? 'bg-gradient-to-r from-red-500 to-red-600' 
-                        : 'bg-gradient-to-r from-green-500 to-emerald-600'
-                    }`} />
+                    <div className={`h-1.5 w-full ${clauseTheme.bar}`} />
                     
                     <div className="p-8">
                       <div className="flex justify-between items-start gap-6 mb-8">
@@ -325,11 +378,7 @@ const App = () => {
                             </span>
                           </div>
                         </div>
-                        <span className={`text-xs font-black px-4 py-2 rounded-lg uppercase tracking-wider flex-shrink-0 ${
-                          clause.risk_level === 'High' 
-                            ? 'bg-red-100 text-red-700' 
-                            : 'bg-green-100 text-green-700'
-                        }`}>
+                        <span className={`text-xs font-black px-4 py-2 rounded-lg uppercase tracking-wider flex-shrink-0 ${clauseTheme.badge}`}>
                           {clause.risk_level} Risk
                         </span>
                       </div>
@@ -346,7 +395,8 @@ const App = () => {
                       </div>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
 
