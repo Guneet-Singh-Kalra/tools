@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
 from app.models.schemas import (
     ClauseDecisionRequest,
     ClauseSuggestionRequest,
+    ContractComparisonResponse,
     ReviewSessionResponse,
     ReviewTextRequest,
 )
 from app.services.review_workflow import (
     apply_clause_decision,
+    compare_original_and_revised_contract,
     build_revised_pdf,
     build_risk_highlight_pdf,
     create_review_session_from_pdf,
@@ -24,7 +26,10 @@ router = APIRouter(prefix="/review", tags=["review"])
 
 
 @router.post("/analyze", response_model=ReviewSessionResponse)
-async def analyze_for_review(file: UploadFile = File(...)) -> ReviewSessionResponse:
+async def analyze_for_review(
+    file: UploadFile = File(...),
+    include_hindi: bool = Query(default=False, description="Include Hindi localization fields in response."),
+) -> ReviewSessionResponse:
     filename = file.filename or "uploaded_document.pdf"
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file.")
@@ -34,7 +39,11 @@ async def analyze_for_review(file: UploadFile = File(...)) -> ReviewSessionRespo
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     try:
-        return create_review_session_from_pdf(file_bytes=file_bytes, document_name=filename)
+        return create_review_session_from_pdf(
+            file_bytes=file_bytes,
+            document_name=filename,
+            include_hindi=include_hindi,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -42,9 +51,12 @@ async def analyze_for_review(file: UploadFile = File(...)) -> ReviewSessionRespo
 
 
 @router.post("/analyze-text", response_model=ReviewSessionResponse)
-async def analyze_text_for_review(payload: ReviewTextRequest) -> ReviewSessionResponse:
+async def analyze_text_for_review(
+    payload: ReviewTextRequest,
+    include_hindi: bool = Query(default=False, description="Include Hindi localization fields in response."),
+) -> ReviewSessionResponse:
     try:
-        return create_review_session_from_text(payload.text, payload.document_name)
+        return create_review_session_from_text(payload.text, payload.document_name, include_hindi=include_hindi)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -55,6 +67,14 @@ async def analyze_text_for_review(payload: ReviewTextRequest) -> ReviewSessionRe
 def fetch_review_session(session_id: str) -> ReviewSessionResponse:
     try:
         return get_review_session(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{session_id}/compare", response_model=ContractComparisonResponse)
+def compare_review_session_versions(session_id: str) -> ContractComparisonResponse:
+    try:
+        return compare_original_and_revised_contract(session_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

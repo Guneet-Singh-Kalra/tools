@@ -29,6 +29,23 @@ Avoid legal jargon. Mention major obligations, penalties, and unusual risks.
 """.strip()
 
 
+HINDI_LOCALIZATION_SYSTEM_PROMPT = """
+You translate legal explanations for normal users into simple Hindi.
+Return strict JSON:
+{
+  "summary_hindi": "...",
+  "clauses_hindi": ["...", "..."]
+}
+
+Rules:
+- Keep meaning accurate to source text.
+- Use simple, clear Hindi (Devanagari script).
+- Keep clause order exactly the same.
+- `clauses_hindi` length must exactly match input clause count.
+- Return JSON only, no markdown and no extra keys.
+""".strip()
+
+
 def build_clause_analysis_user_prompt(clause_text: str, chunk_index: int, total_chunks: int) -> str:
     return f"""
 Chunk {chunk_index}/{total_chunks}
@@ -56,4 +73,19 @@ Clause highlights:
 {compact_clauses}
 
 Write a short plain-English summary (4-7 sentences) for a normal user.
+""".strip()
+
+
+def build_hindi_localization_user_prompt(summary: str, clause_explanations: list[str]) -> str:
+    clause_lines = "\n".join(f"{idx}. {item}" for idx, item in enumerate(clause_explanations, start=1))
+    return f"""
+English summary:
+{summary}
+
+Clause explanations in English:
+{clause_lines}
+
+Translate into Hindi and return strict JSON with:
+- summary_hindi
+- clauses_hindi (same order, same count)
 """.strip()

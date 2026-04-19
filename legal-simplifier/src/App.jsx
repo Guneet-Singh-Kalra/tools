@@ -9,6 +9,10 @@ import {
 } from 'lucide-react';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+const LANGUAGE_OPTIONS = [
+  { value: 'en', label: 'English' },
+  { value: 'hi', label: 'Hindi' },
+];
 
 // ─── GUARDRAILS ────────────────────────────────────────────────────────────────
 const ALLOWED_RISK   = ['High', 'Medium', 'Low'];
@@ -30,8 +34,11 @@ function validateResponse(raw) {
   if (!Array.isArray(raw.top_red_flags))        errors.push('top_red_flags must be an array');
   if (!Array.isArray(raw.clauses))              errors.push('clauses must be an array');
   const validClauses = (raw.clauses || []).filter(validateClause).map(c => ({
+    clause_id:          sanitize(c.clause_id || '', 120),
+    status:             sanitize(c.status || 'pending', 30),
     clause_title:       sanitize(c.clause_title, 120),
     plain_english:      sanitize(c.plain_english, 600),
+    plain_hindi:        sanitize(c.plain_hindi || '', 700),
     risk_level:         c.risk_level,
     why_risky:          sanitize(c.why_risky, 600),
     who_it_favors:      ALLOWED_FAVORS.includes(c.who_it_favors) ? c.who_it_favors : 'Neutral',
@@ -47,6 +54,7 @@ function validateResponse(raw) {
     document_name: sanitize(raw.document_name, 200),
     overall_risk:  raw.overall_risk,
     summary:       sanitize(raw.summary, 1000),
+    summary_hindi: sanitize(raw.summary_hindi || '', 1200),
     top_red_flags: (raw.top_red_flags || []).map(f => sanitize(f, 300)).filter(Boolean).slice(0, 10),
     clauses:       validClauses,
   };
@@ -100,6 +108,7 @@ function mapReviewResponse(raw) {
     document_name: sanitize(raw.document_name || 'uploaded_document', 200),
     overall_risk: ALLOWED_RISK.includes(raw.overall_risk) ? raw.overall_risk : 'Low',
     summary: sanitize(raw.summary || '', 1000),
+    summary_hindi: sanitize(raw.summary_hindi || '', 1200),
     top_red_flags: (raw.top_red_flags || []).map(f => sanitize(f, 300)).filter(Boolean),
     clauses: clauses.map((c, idx) => {
       const currentRisk = ALLOWED_RISK.includes(c.risk_level) ? c.risk_level : 'Low';
@@ -109,6 +118,7 @@ function mapReviewResponse(raw) {
         status: c.status || 'pending',
         clause_title: sanitize(c.clause_title || `Clause ${idx + 1}`, 120),
         plain_english: sanitize(c.plain_english || '', 600),
+        plain_hindi: sanitize(c.plain_hindi || '', 700),
         risk_level: currentRisk,
         why_risky: sanitize(c.why_risky || '', 600),
         who_it_favors: ALLOWED_FAVORS.includes(c.who_it_favors) ? c.who_it_favors : 'Neutral',
@@ -127,6 +137,34 @@ function statusToDecision(status) {
   if (status === 'accepted') return 'approved';
   if (status === 'declined') return 'denied';
   return undefined;
+}
+
+function mapComparisonResponse(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const clauses = Array.isArray(raw.clauses) ? raw.clauses : [];
+  return {
+    session_id: sanitize(raw.session_id || '', 120),
+    document_name: sanitize(raw.document_name || '', 200),
+    total_clauses: Number(raw.total_clauses) || 0,
+    changed_clauses: Number(raw.changed_clauses) || 0,
+    accepted_changes: Number(raw.accepted_changes) || 0,
+    declined_changes: Number(raw.declined_changes) || 0,
+    pending_suggestions: Number(raw.pending_suggestions) || 0,
+    original_contract_text: sanitize(raw.original_contract_text || '', 50000),
+    revised_contract_text: sanitize(raw.revised_contract_text || '', 50000),
+    unified_diff: sanitize(raw.unified_diff || '', 50000),
+    clauses: clauses.map((c, idx) => ({
+      clause_id: sanitize(c.clause_id || `clause-${idx + 1}`, 120),
+      clause_title: sanitize(c.clause_title || `Clause ${idx + 1}`, 120),
+      status: sanitize(c.status || 'pending', 20),
+      changed: Boolean(c.changed),
+      similarity: typeof c.similarity === 'number' ? c.similarity : 1,
+      suggestion_instruction: sanitize(c.suggestion_instruction || '', 700),
+      original_text: sanitize(c.original_text || '', 5000),
+      revised_text: sanitize(c.revised_text || '', 5000),
+      change_summary: sanitize(c.change_summary || '', 900),
+    })),
+  };
 }
 
 // ─── PDF VIEWER ────────────────────────────────────────────────────────────────
@@ -431,7 +469,7 @@ function PdfViewer({ file, clauses, focusClauseIndex, onClose }) {
 }
 
 // ─── CLAUSE REVIEW CARD ────────────────────────────────────────────────────────
-function ClauseReviewCard({ clause, index, decision, onDecide, onRequestChange, chatHistory, onViewInPdf }) {
+function ClauseReviewCard({ clause, index, decision, onDecide, onRequestChange, chatHistory, onViewInPdf, selectedLanguage }) {
   const [expanded,  setExpanded]  = useState(false);
   const [showDiff,  setShowDiff]  = useState(false);
   const [chatOpen,  setChatOpen]  = useState(false);
@@ -443,6 +481,9 @@ function ClauseReviewCard({ clause, index, decision, onDecide, onRequestChange, 
   const { origOut, revOut } = highlightDiff(clause.original_text, clause.alternate_clause);
   const isApproved = decision === 'approved';
   const isDenied   = decision === 'denied';
+  const clauseExplanation = selectedLanguage === 'hi' && clause.plain_hindi
+    ? clause.plain_hindi
+    : clause.plain_english;
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior:'smooth' }); }, [localChat]);
 
@@ -476,7 +517,7 @@ function ClauseReviewCard({ clause, index, decision, onDecide, onRequestChange, 
             </span>
             {clause.alternate_clause && <RiskDelta before={clause.risk_level} after={clause.risk_after_fix}/>}
           </div>
-          <p style={{ fontSize:13, color:'#475569', margin:0, fontStyle:'italic' }}>"{clause.plain_english}"</p>
+          <p style={{ fontSize:13, color:'#475569', margin:0, fontStyle:'italic' }}>"{clauseExplanation}"</p>
         </div>
         <div style={{ display:'flex', gap:6, flexShrink:0, alignItems:'center' }}>
           <button onClick={() => onViewInPdf(index)}
@@ -639,6 +680,10 @@ export default function App() {
   const [loading,          setLoading]          = useState(false);
   const [data,             setData]             = useState(null);
   const [sessionId,        setSessionId]        = useState('');
+  const [selectedLanguage, setSelectedLanguage] = useState('en');
+  const [comparisonData,   setComparisonData]   = useState(null);
+  const [comparisonLoading,setComparisonLoading]= useState(false);
+  const [comparisonError,  setComparisonError]  = useState('');
   const [guardrailErrors,  setGuardrailErrors]  = useState([]);
   const [pageReady,        setPageReady]        = useState(false);
   const [decisions,        setDecisions]        = useState({});
@@ -652,6 +697,25 @@ export default function App() {
 
   useEffect(() => { setPageReady(true); }, []);
   useEffect(() => { if (showFinalDoc) finalDocRef.current?.scrollIntoView({ behavior:'smooth' }); }, [showFinalDoc]);
+
+  async function fetchComparison(currentSessionId) {
+    if (!currentSessionId) return;
+    setComparisonLoading(true);
+    setComparisonError('');
+    try {
+      const response = await fetch(`${API_BASE_URL}/review/${currentSessionId}/compare`);
+      const raw = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(raw?.detail || 'Could not fetch comparison');
+      const mapped = mapComparisonResponse(raw);
+      if (!mapped) throw new Error('Invalid comparison response');
+      setComparisonData(mapped);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Comparison fetch failed';
+      setComparisonError(msg);
+    } finally {
+      setComparisonLoading(false);
+    }
+  }
 
   function applyReviewResponse(raw) {
     const mapped = mapReviewResponse(raw);
@@ -668,9 +732,11 @@ export default function App() {
       return;
     }
 
-    setSessionId(mapped.session_id || sessionId);
+    const currentSessionId = mapped.session_id || sessionId;
+    setSessionId(currentSessionId);
     setData(mapped);
     setGuardrailErrors([]);
+    if (currentSessionId) fetchComparison(currentSessionId);
 
     const synced = {};
     mapped.clauses.forEach((clause, idx) => {
@@ -687,6 +753,8 @@ export default function App() {
     setDecisions({});
     setChatRevisions({});
     setChatHistories({});
+    setComparisonData(null);
+    setComparisonError('');
     setShowFinalDoc(false);
 
     try {
@@ -696,10 +764,10 @@ export default function App() {
       if (lowerName.endsWith('.pdf')) {
         const formData = new FormData();
         formData.append('file', file);
-        response = await fetch(`${API_BASE_URL}/review/analyze`, { method: 'POST', body: formData });
+        response = await fetch(`${API_BASE_URL}/review/analyze?include_hindi=true`, { method: 'POST', body: formData });
       } else if (lowerName.endsWith('.txt')) {
         const text = await file.text();
-        response = await fetch(`${API_BASE_URL}/review/analyze-text`, {
+        response = await fetch(`${API_BASE_URL}/review/analyze-text?include_hindi=true`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ document_name: file.name, text }),
@@ -775,6 +843,9 @@ export default function App() {
   const allReviewed     = totalAlternates > 0 && reviewedCount >= totalAlternates;
   const approvedCount   = data ? data.clauses.filter(c => c.status === 'accepted').length : 0;
   const chatModCount    = Object.values(chatRevisions).filter(Boolean).length;
+  const summaryText = data
+    ? (selectedLanguage === 'hi' && data.summary_hindi ? data.summary_hindi : data.summary)
+    : '';
 
   function generateFinalDoc() { setFinalDoc(buildFinalDocument(data, decisions, chatRevisions)); setShowFinalDoc(true); }
   function downloadDoc() {
@@ -1002,6 +1073,18 @@ export default function App() {
                 <p style={{ fontSize:12, color:'#94A3B8', margin:0 }}>Expand each clause · view in PDF · approve or decline changes</p>
               </div>
               <div style={{ display:'flex', gap:7 }}>
+                <div style={{ display:'flex', alignItems:'center', gap:6, background:'#F8FAFC', border:'1px solid #E2E8F0', borderRadius:10, padding:'6px 10px' }}>
+                  <span style={{ fontSize:12, color:'#64748B', fontWeight:700 }}>Explain in</span>
+                  <select
+                    value={selectedLanguage}
+                    onChange={(e) => setSelectedLanguage(e.target.value)}
+                    style={{ border:'1px solid #CBD5E1', borderRadius:8, padding:'4px 8px', fontSize:12, fontWeight:600, color:'#1E293B', background:'#fff', outline:'none' }}
+                  >
+                    {LANGUAGE_OPTIONS.map(opt => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                </div>
                 <button onClick={() => setShowPdf(true)}
                   style={{ display:'flex', alignItems:'center', gap:6, background:'#EFF6FF', border:'1px solid #BFDBFE', borderRadius:10, padding:'6px 13px', fontWeight:700, fontSize:13, color:'#1D4ED8', cursor:'pointer' }}>
                   <Layers size={13}/> PDF Viewer
@@ -1033,7 +1116,12 @@ export default function App() {
                 <Eye size={14} color="#2563EB"/>
                 <span style={{ fontSize:10, fontWeight:700, textTransform:'uppercase', letterSpacing:1, color:'#64748B' }}>Executive Summary</span>
               </div>
-              <p style={{ fontSize:14, lineHeight:1.7, color:'#334155', margin:0 }}>{data.summary}</p>
+              <p style={{ fontSize:14, lineHeight:1.7, color:'#334155', margin:0 }}>{summaryText}</p>
+              {selectedLanguage === 'hi' && !data.summary_hindi && (
+                <p style={{ margin:'10px 0 0', fontSize:12, color:'#B45309' }}>
+                  Hindi translation is not available for this response. Showing English fallback.
+                </p>
+              )}
             </div>
 
             {/* Red flags */}
@@ -1050,6 +1138,92 @@ export default function App() {
                   </div>
                 ))}
               </div>
+            </div>
+
+            {/* Original vs Revised - Versus view */}
+            <div style={{ background:'#FFFFFF', border:'1px solid #E2E8F0', borderRadius:13, padding:'16px 20px' }}>
+              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, flexWrap:'wrap', marginBottom:12 }}>
+                <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+                  <ArrowRight size={14} color="#2563EB" />
+                  <span style={{ fontSize:12, fontWeight:800, textTransform:'uppercase', letterSpacing:1, color:'#334155' }}>
+                    Original vs Revised (Versus View)
+                  </span>
+                </div>
+                <button
+                  onClick={() => fetchComparison(sessionId)}
+                  disabled={!sessionId || comparisonLoading}
+                  style={{ background: comparisonLoading ? '#CBD5E1' : '#2563EB', color:'#fff', border:'none', borderRadius:8, padding:'6px 12px', fontSize:12, fontWeight:700, cursor:comparisonLoading?'not-allowed':'pointer' }}
+                >
+                  {comparisonLoading ? 'Refreshing...' : 'Refresh comparison'}
+                </button>
+              </div>
+
+              {comparisonError && (
+                <div style={{ background:'#FEF2F2', border:'1px solid #FECACA', borderRadius:8, padding:'8px 10px', color:'#B91C1C', fontSize:12, marginBottom:10 }}>
+                  {comparisonError}
+                </div>
+              )}
+
+              {comparisonData ? (
+                <>
+                  <div style={{ display:'grid', gridTemplateColumns:'repeat(5, minmax(0, 1fr))', gap:8, marginBottom:12 }}>
+                    {[
+                      { label:'Total', value:comparisonData.total_clauses, color:'#1E3A8A', bg:'#EFF6FF' },
+                      { label:'Changed', value:comparisonData.changed_clauses, color:'#7C2D12', bg:'#FFF7ED' },
+                      { label:'Accepted', value:comparisonData.accepted_changes, color:'#166534', bg:'#F0FDF4' },
+                      { label:'Declined', value:comparisonData.declined_changes, color:'#991B1B', bg:'#FEF2F2' },
+                      { label:'Pending', value:comparisonData.pending_suggestions, color:'#92400E', bg:'#FFFBEB' },
+                    ].map(card => (
+                      <div key={card.label} style={{ background:card.bg, borderRadius:10, padding:'9px 10px', textAlign:'center' }}>
+                        <p style={{ margin:'0 0 3px', fontSize:10, fontWeight:700, color:'#64748B', textTransform:'uppercase', letterSpacing:1 }}>{card.label}</p>
+                        <p style={{ margin:0, fontSize:20, fontWeight:900, color:card.color }}>{card.value}</p>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:12 }}>
+                    <div style={{ background:'#FEF2F2', border:'1px solid #FECACA', borderRadius:10, padding:10 }}>
+                      <p style={{ margin:'0 0 6px', fontSize:11, fontWeight:800, color:'#991B1B', textTransform:'uppercase', letterSpacing:1 }}>Original Contract</p>
+                      <pre style={{ margin:0, fontSize:11, lineHeight:1.6, color:'#334155', whiteSpace:'pre-wrap', maxHeight:210, overflowY:'auto' }}>
+                        {comparisonData.original_contract_text || 'No original contract text available.'}
+                      </pre>
+                    </div>
+                    <div style={{ background:'#F0FDF4', border:'1px solid #BBF7D0', borderRadius:10, padding:10 }}>
+                      <p style={{ margin:'0 0 6px', fontSize:11, fontWeight:800, color:'#166534', textTransform:'uppercase', letterSpacing:1 }}>Revised Contract</p>
+                      <pre style={{ margin:0, fontSize:11, lineHeight:1.6, color:'#334155', whiteSpace:'pre-wrap', maxHeight:210, overflowY:'auto' }}>
+                        {comparisonData.revised_contract_text || 'No revised contract text available.'}
+                      </pre>
+                    </div>
+                  </div>
+
+                  <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+                    {comparisonData.clauses.filter(c => c.changed).slice(0, 6).map((c) => {
+                      const { origOut, revOut } = highlightDiff(c.original_text, c.revised_text);
+                      return (
+                        <div key={c.clause_id} style={{ border:'1px solid #E2E8F0', borderRadius:10, padding:'10px 12px', background:'#F8FAFC' }}>
+                          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, marginBottom:8, flexWrap:'wrap' }}>
+                            <p style={{ margin:0, fontSize:13, fontWeight:800, color:'#0F172A' }}>{c.clause_title}</p>
+                            <span style={{ fontSize:11, fontWeight:700, color:'#475569', background:'#E2E8F0', borderRadius:20, padding:'3px 10px' }}>
+                              Similarity: {Math.round((c.similarity || 0) * 100)}%
+                            </span>
+                          </div>
+                          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+                            <p style={{ margin:0, fontSize:12, lineHeight:1.6, background:'#FEF2F2', border:'1px solid #FECACA', borderRadius:8, padding:8 }}>{origOut}</p>
+                            <p style={{ margin:0, fontSize:12, lineHeight:1.6, background:'#F0FDF4', border:'1px solid #BBF7D0', borderRadius:8, padding:8 }}>{revOut}</p>
+                          </div>
+                          {c.change_summary && (
+                            <p style={{ margin:'8px 0 0', fontSize:12, color:'#475569' }}>{c.change_summary}</p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              ) : (
+                <p style={{ margin:0, fontSize:12, color:'#94A3B8' }}>
+                  Comparison data will appear after session analysis is loaded.
+                </p>
+              )}
             </div>
 
             {/* Clause review section */}
@@ -1088,6 +1262,7 @@ export default function App() {
                     onRequestChange={handleRequestChange}
                     chatHistory={chatHistories[i] || []}
                     onViewInPdf={handleViewInPdf}
+                    selectedLanguage={selectedLanguage}
                   />
                 ))}
               </div>

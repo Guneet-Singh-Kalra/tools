@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import textwrap
 from dataclasses import dataclass
+from difflib import SequenceMatcher, unified_diff
 from io import BytesIO
 from typing import Optional
 from uuid import uuid4
@@ -12,11 +13,14 @@ import fitz
 from app.models.schemas import (
     ClauseDecisionRequest,
     ClauseSuggestionRequest,
+    ClauseComparison,
+    ContractComparisonResponse,
     ReviewClause,
     ReviewSessionResponse,
 )
 from app.services.chunker import chunk_legal_text
 from app.services.llm_analyzer import analyze_clauses_with_llm
+from app.services.localization import localize_summary_and_clauses_to_hindi, translate_text_to_hindi
 from app.services.pdf_parser import clean_legal_text, extract_text_from_pdf_bytes
 from app.services.risk_engine import (
     apply_risk_scoring,
@@ -35,6 +39,8 @@ class _ReviewSession:
     source_pdf_bytes: Optional[bytes]
     overall_risk: str
     summary: str
+    summary_hindi: Optional[str]
+    include_hindi: bool
     top_red_flags: list[str]
     clauses: list[ReviewClause]
 
@@ -42,19 +48,33 @@ class _ReviewSession:
 REVIEW_SESSIONS: dict[str, _ReviewSession] = {}
 
 
-def create_review_session_from_pdf(file_bytes: bytes, document_name: str) -> ReviewSessionResponse:
+def create_review_session_from_pdf(
+    file_bytes: bytes,
+    document_name: str,
+    include_hindi: bool = False,
+) -> ReviewSessionResponse:
     raw_text = extract_text_from_pdf_bytes(file_bytes)
     cleaned_text = clean_legal_text(raw_text)
     if not cleaned_text:
         raise ValueError("No readable text found in this PDF.")
-    return _create_review_session(cleaned_text, document_name, source_pdf_bytes=file_bytes)
+    return _create_review_session(
+        cleaned_text,
+        document_name,
+        source_pdf_bytes=file_bytes,
+        include_hindi=include_hindi,
+    )
 
 
-def create_review_session_from_text(text: str, document_name: str) -> ReviewSessionResponse:
+def create_review_session_from_text(text: str, document_name: str, include_hindi: bool = False) -> ReviewSessionResponse:
     cleaned_text = clean_legal_text(text)
     if not cleaned_text:
         raise ValueError("Input text is empty after cleaning.")
-    return _create_review_session(cleaned_text, document_name, source_pdf_bytes=None)
+    return _create_review_session(
+        cleaned_text,
+        document_name,
+        source_pdf_bytes=None,
+        include_hindi=include_hindi,
+    )
 
 
 def get_review_session(session_id: str) -> ReviewSessionResponse:
@@ -158,9 +178,7 @@ def build_revised_pdf(session_id: str) -> bytes:
 
     blocks: list[str] = []
     for idx, clause in enumerate(session.clauses, start=1):
-        effective_text = clause.original_text
-        if clause.status == "accepted" and clause.suggested_text:
-            effective_text = clause.suggested_text
+        effective_text = _effective_clause_text(clause)
 
         blocks.append(f"{idx}. {clause.clause_title}\nStatus: {clause.status.upper()}\n{effective_text}")
 
@@ -169,10 +187,82 @@ def build_revised_pdf(session_id: str) -> bytes:
     return _render_text_to_pdf_bytes(title=session.document_name, body=f"{header}\n{revised_text}")
 
 
+def compare_original_and_revised_contract(session_id: str) -> ContractComparisonResponse:
+    session = _require_session(session_id)
+
+    clause_diffs: list[ClauseComparison] = []
+    original_parts: list[str] = []
+    revised_parts: list[str] = []
+
+    accepted_changes = 0
+    declined_changes = 0
+    pending_suggestions = 0
+    changed_clauses = 0
+
+    for idx, clause in enumerate(session.clauses, start=1):
+        original_text = (clause.original_text or "").strip()
+        revised_text = _effective_clause_text(clause).strip()
+        changed = _normalize_compare_text(original_text) != _normalize_compare_text(revised_text)
+
+        if clause.status == "accepted":
+            accepted_changes += 1
+        elif clause.status == "declined":
+            declined_changes += 1
+        elif clause.suggested_text:
+            pending_suggestions += 1
+
+        if changed:
+            changed_clauses += 1
+
+        original_parts.append(f"{idx}. {clause.clause_title}\n{original_text}")
+        revised_parts.append(f"{idx}. {clause.clause_title}\n{revised_text}")
+
+        clause_diffs.append(
+            ClauseComparison(
+                clause_id=clause.clause_id,
+                clause_title=clause.clause_title,
+                status=clause.status,
+                changed=changed,
+                similarity=_similarity_score(original_text, revised_text),
+                suggestion_instruction=clause.suggestion_instruction,
+                original_text=original_text,
+                revised_text=revised_text,
+                change_summary=_build_change_summary(clause, changed),
+            )
+        )
+
+    original_contract_text = "\n\n".join(original_parts)
+    revised_contract_text = "\n\n".join(revised_parts)
+    diff_text = "".join(
+        unified_diff(
+            original_contract_text.splitlines(keepends=True),
+            revised_contract_text.splitlines(keepends=True),
+            fromfile=f"{session.document_name} (original)",
+            tofile=f"{session.document_name} (revised)",
+            lineterm="",
+        )
+    )
+
+    return ContractComparisonResponse(
+        session_id=session.session_id,
+        document_name=session.document_name,
+        total_clauses=len(session.clauses),
+        changed_clauses=changed_clauses,
+        accepted_changes=accepted_changes,
+        declined_changes=declined_changes,
+        pending_suggestions=pending_suggestions,
+        original_contract_text=original_contract_text,
+        revised_contract_text=revised_contract_text,
+        unified_diff=diff_text,
+        clauses=clause_diffs,
+    )
+
+
 def _create_review_session(
     cleaned_text: str,
     document_name: str,
     source_pdf_bytes: Optional[bytes],
+    include_hindi: bool = False,
 ) -> ReviewSessionResponse:
     chunks = chunk_legal_text(cleaned_text)
     if not chunks:
@@ -190,6 +280,13 @@ def _create_review_session(
         overall_risk=overall_risk,
         top_red_flags=top_red_flags,
     )
+    summary_hindi = None
+    clause_hindi: list[str | None] = [None for _ in scored_in_order]
+    if include_hindi:
+        summary_hindi, clause_hindi = localize_summary_and_clauses_to_hindi(
+            summary,
+            [analysis.plain_english for analysis in scored_in_order],
+        )
 
     review_clauses: list[ReviewClause] = []
     for idx, (chunk, analysis) in enumerate(zip(chunks, scored_in_order), start=1):
@@ -198,6 +295,7 @@ def _create_review_session(
                 clause_id=f"clause-{idx}",
                 clause_title=analysis.clause_title,
                 plain_english=analysis.plain_english,
+                plain_hindi=clause_hindi[idx - 1] if idx - 1 < len(clause_hindi) else None,
                 risk_level=analysis.risk_level,
                 risk_score=analysis.risk_score,
                 risk_type=analysis.risk_type,
@@ -215,6 +313,8 @@ def _create_review_session(
         source_pdf_bytes=source_pdf_bytes,
         overall_risk=overall_risk,
         summary=summary,
+        summary_hindi=summary_hindi,
+        include_hindi=include_hindi,
         top_red_flags=top_red_flags,
         clauses=review_clauses,
     )
@@ -241,6 +341,8 @@ def _refresh_summary_fields(session: _ReviewSession) -> None:
         f"{session.document_name} currently has an overall {session.overall_risk} risk profile. "
         f"Accepted clauses are reflected in the revised draft export."
     )
+    if session.include_hindi:
+        session.summary_hindi = translate_text_to_hindi(session.summary)
 
 
 def _build_suggestion(original_text: str, instruction: str) -> tuple[str, str]:
@@ -293,6 +395,39 @@ def _best_search_token(clause_text: str) -> str:
     return token.strip()
 
 
+def _effective_clause_text(clause: ReviewClause) -> str:
+    if clause.status == "accepted" and clause.suggested_text:
+        return clause.suggested_text
+    return clause.original_text
+
+
+def _normalize_compare_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _similarity_score(original: str, revised: str) -> float:
+    left = _normalize_compare_text(original)
+    right = _normalize_compare_text(revised)
+    if not left and not right:
+        return 1.0
+    return round(SequenceMatcher(None, left, right).ratio(), 3)
+
+
+def _build_change_summary(clause: ReviewClause, changed: bool) -> str:
+    if clause.status == "accepted":
+        if changed:
+            return clause.suggestion_reason or "Accepted suggestion was applied to this clause."
+        return "Suggestion was accepted, but revised text matches the original clause."
+
+    if clause.status == "declined":
+        return "Suggestion was declined, so original clause text was kept."
+
+    if clause.suggested_text:
+        return "Suggestion exists but is still pending user decision."
+
+    return "No suggestion has been applied to this clause."
+
+
 def _render_text_to_pdf_bytes(title: str, body: str) -> bytes:
     doc = fitz.open()
 
@@ -336,6 +471,7 @@ def _to_response(session: _ReviewSession) -> ReviewSessionResponse:
         document_name=session.document_name,
         overall_risk=session.overall_risk,
         summary=session.summary,
+        summary_hindi=session.summary_hindi,
         top_red_flags=session.top_red_flags,
         clauses=session.clauses,
     )
