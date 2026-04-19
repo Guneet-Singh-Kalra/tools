@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import {
   ShieldAlert, FileText, Upload, AlertTriangle,
   ArrowRight, Zap, Eye, RefreshCw, ChevronDown, ChevronUp,
@@ -6,6 +7,8 @@ import {
   ThumbsDown, MessageSquare, Download, Send, CheckSquare,
   Layers, Search, ZoomIn, ZoomOut, ChevronLeft, ChevronRight
 } from 'lucide-react';
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
 
 // ─── GUARDRAILS ────────────────────────────────────────────────────────────────
 const ALLOWED_RISK   = ['High', 'Medium', 'Low'];
@@ -88,52 +91,42 @@ function highlightDiff(original, revised) {
   return { origOut, revOut };
 }
 
-// ─── MOCK BACKEND ──────────────────────────────────────────────────────────────
-function mockBackendResponse(filename) {
+function mapReviewResponse(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const clauses = Array.isArray(raw.clauses) ? raw.clauses : [];
+
   return {
-    document_name: filename, overall_risk: 'Medium',
-    summary: 'This software licence agreement contains several clauses that disproportionately favour the provider. The auto-renewal mechanism, liability cap, and data-sharing provisions represent material risks that should be renegotiated before signing.',
-    top_red_flags: [
-      'Automatic 12-month renewal without email notice — 90 days written cancellation required',
-      'Provider can change pricing with only 7 days notice, unilaterally',
-      'Unlimited data harvesting permitted for third-party marketing purposes',
-    ],
-    clauses: [
-      {
-        clause_title: 'Section 4.2: Auto-Renewal', risk_level: 'High', who_it_favors: 'Company',
-        plain_english: 'The contract resets itself every year and charges you automatically.',
-        why_risky: 'Requires 90-day written notice to cancel. Missing the window locks you in for another full year.',
-        original_text: 'This Agreement shall automatically renew for successive one (1) year terms unless either party provides written notice of non-renewal at least ninety (90) days prior to the end of the then-current term.',
-        alternate_clause: 'This Agreement shall automatically renew for successive one (1) year terms unless either party provides written notice of non-renewal at least thirty (30) days prior to the end of the then-current term. Provider shall send written renewal notice to Customer no less than sixty (60) days before any renewal date.',
-        improvement_reason: 'Reduces notice window from 90 to 30 days and requires the provider to actively notify you before renewal.',
-        risk_after_fix: 'Low',
-        data_citation: 'Per the 2024 Thomson Reuters Contract Lifecycle Report, 67% of auto-renewal disputes stem from inadequate advance notice.',
-        data_citation_url: 'https://www.ftc.gov/business-guidance/negative-option',
-      },
-      {
-        clause_title: 'Section 8.1: Liability Cap', risk_level: 'High', who_it_favors: 'Company',
-        plain_english: "If they lose your data or breach the contract, you can't sue for more than $50.",
-        why_risky: 'A $50 damage cap is grossly inadequate given potential data breach costs.',
-        original_text: "IN NO EVENT SHALL PROVIDER'S TOTAL LIABILITY EXCEED FIFTY DOLLARS ($50.00) REGARDLESS OF THE FORM OF ACTION.",
-        alternate_clause: "Provider's total liability for any claim shall not exceed the greater of (a) fees paid in the twelve (12) months preceding the claim, or (b) Five Thousand Dollars ($5,000). This cap shall not apply to breaches of confidentiality, gross negligence, or wilful misconduct.",
-        improvement_reason: 'Ties liability to actual contract value. Carve-outs for wilful misconduct ensure the provider cannot cap liability for their worst failures.',
-        risk_after_fix: 'Low',
-        data_citation: 'IBM Cost of a Data Breach Report 2024: average SMB breach cost is $4.88M.',
-        data_citation_url: 'https://www.ibm.com/reports/data-breach',
-      },
-      {
-        clause_title: 'Section 12: Data Privacy', risk_level: 'Medium', who_it_favors: 'Company',
-        plain_english: 'They can use your usage statistics to improve their own AI models.',
-        why_risky: 'May conflict with your privacy obligations if your data contains personal information of your customers.',
-        original_text: 'Customer grants Provider a non-exclusive, royalty-free licence to use anonymised Customer usage data for product improvement, analytics, and machine-learning model training purposes.',
-        alternate_clause: 'Customer grants Provider a non-exclusive, royalty-free licence to use anonymised aggregate usage data solely for product improvement and analytics. Provider shall not use Customer data to train any machine-learning model without explicit prior written consent. Customer may opt out at any time.',
-        improvement_reason: 'Separates analytics from AI training, adds an explicit opt-out right, and requires affirmative consent for model training.',
-        risk_after_fix: 'Low',
-        data_citation: 'GDPR Article 22 and CCPA §1798.120 require explicit consent for automated decision-making using personal data.',
-        data_citation_url: 'https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/artificial-intelligence/',
-      },
-    ],
+    session_id: sanitize(raw.session_id || '', 120),
+    document_name: sanitize(raw.document_name || 'uploaded_document', 200),
+    overall_risk: ALLOWED_RISK.includes(raw.overall_risk) ? raw.overall_risk : 'Low',
+    summary: sanitize(raw.summary || '', 1000),
+    top_red_flags: (raw.top_red_flags || []).map(f => sanitize(f, 300)).filter(Boolean),
+    clauses: clauses.map((c, idx) => {
+      const currentRisk = ALLOWED_RISK.includes(c.risk_level) ? c.risk_level : 'Low';
+      const riskAfterFix = currentRisk === 'High' ? 'Medium' : 'Low';
+      return {
+        clause_id: sanitize(c.clause_id || `clause-${idx + 1}`, 120),
+        status: c.status || 'pending',
+        clause_title: sanitize(c.clause_title || `Clause ${idx + 1}`, 120),
+        plain_english: sanitize(c.plain_english || '', 600),
+        risk_level: currentRisk,
+        why_risky: sanitize(c.why_risky || '', 600),
+        who_it_favors: ALLOWED_FAVORS.includes(c.who_it_favors) ? c.who_it_favors : 'Neutral',
+        original_text: sanitize(c.original_text || c.plain_english || '', 2000),
+        alternate_clause: sanitize(c.suggested_text || '', 2000),
+        improvement_reason: sanitize(c.suggestion_reason || '', 800),
+        risk_after_fix: riskAfterFix,
+        data_citation: '',
+        data_citation_url: null,
+      };
+    }),
   };
+}
+
+function statusToDecision(status) {
+  if (status === 'accepted') return 'approved';
+  if (status === 'declined') return 'denied';
+  return undefined;
 }
 
 // ─── PDF VIEWER ────────────────────────────────────────────────────────────────
@@ -186,6 +179,7 @@ function PdfViewer({ file, clauses, focusClauseIndex, onClose }) {
 
   async function buildMatchMap(pdf) {
     const map = {};
+    const flaggedClauses = clauses.filter(c => c.risk_level === 'High' || c.risk_level === 'Medium');
     for (let p = 1; p <= pdf.numPages; p++) {
       const page  = await pdf.getPage(p);
       const vp    = page.getViewport({ scale: 1 });
@@ -201,15 +195,25 @@ function PdfViewer({ file, clauses, focusClauseIndex, onClose }) {
       }
       const fullLower = full.toLowerCase();
 
-      for (const clause of clauses) {
-        // Use first 55 chars of original_text as search needle
-        const needle = clause.original_text.trim().slice(0, 55).toLowerCase().replace(/\s+/g, ' ');
-        if (needle.length < 10) continue;
-        const idx = fullLower.indexOf(needle);
-        if (idx === -1) continue;
+      for (const clause of flaggedClauses) {
+        const tokens = [
+          clause.clause_title,
+          clause.original_text?.trim().slice(0, 80),
+          clause.original_text?.trim().slice(0, 55),
+          clause.plain_english?.trim().slice(0, 55),
+        ]
+          .filter(Boolean)
+          .map(v => v.toLowerCase().replace(/\s+/g, ' '))
+          .filter(v => v.length >= 10);
 
-        const end  = idx + needle.length;
-        const hits = segs.filter(s => s.start < end && s.start + s.str.length + 1 > idx);
+        let hits = [];
+        for (const needle of tokens) {
+          const idx = fullLower.indexOf(needle);
+          if (idx === -1) continue;
+          const end = idx + needle.length;
+          hits = segs.filter(s => s.start < end && s.start + s.str.length + 1 > idx);
+          if (hits.length) break;
+        }
         if (!hits.length) continue;
 
         const xs = hits.map(s => s.tx);
@@ -220,7 +224,12 @@ function PdfViewer({ file, clauses, focusClauseIndex, onClose }) {
         const h  = Math.max(...ys) - y + hits[0].h;
 
         if (!map[p]) map[p] = [];
-        map[p].push({ clause_title: clause.clause_title, risk_level: clause.risk_level, rect: { x, y, w, h } });
+        map[p].push({
+          clause_title: clause.clause_title,
+          clause_id: clause.clause_id || clause.clause_title,
+          risk_level: clause.risk_level,
+          rect: { x, y, w, h },
+        });
       }
     }
     return map;
@@ -261,17 +270,22 @@ function PdfViewer({ file, clauses, focusClauseIndex, onClose }) {
         oc.clearRect(0, 0, ov.width, ov.height);
 
         const hits = matchMap[pageNum] || [];
+        const focused = focusClauseIndex != null ? clauses[focusClauseIndex] : null;
+        const focusedId = focused?.clause_id || focused?.clause_title;
         hits.forEach(h => {
           const { x, y, w, h: rh } = h.rect;
           const sx = x * scale, sy = y * scale, sw = Math.max(w * scale, 80), sh = Math.max(rh * scale, 14);
+          const isFocus = focusedId && (h.clause_id === focusedId || h.clause_title === focusedId);
+          const alpha = focusedId ? (isFocus ? 0.34 : 0.14) : 0.22;
+          const lineWidth = focusedId ? (isFocus ? 3 : 1.5) : 2;
           if (h.risk_level === 'High') {
-            oc.fillStyle   = 'rgba(239,68,68,0.22)';
-            oc.strokeStyle = 'rgba(220,38,38,0.85)';
+            oc.fillStyle   = `rgba(239,68,68,${alpha})`;
+            oc.strokeStyle = isFocus ? 'rgba(185,28,28,0.95)' : 'rgba(220,38,38,0.85)';
           } else {
-            oc.fillStyle   = 'rgba(234,179,8,0.22)';
-            oc.strokeStyle = 'rgba(202,138,4,0.85)';
+            oc.fillStyle   = `rgba(234,179,8,${alpha})`;
+            oc.strokeStyle = isFocus ? 'rgba(180,83,9,0.95)' : 'rgba(202,138,4,0.85)';
           }
-          oc.lineWidth = 2;
+          oc.lineWidth = lineWidth;
           oc.fillRect(sx, sy, sw, sh);
           oc.strokeRect(sx, sy, sw, sh);
 
@@ -290,7 +304,7 @@ function PdfViewer({ file, clauses, focusClauseIndex, onClose }) {
         });
       } catch { /* render cancelled or page unmounted */ }
     })();
-  }, [pdfDoc, pageNum, scale, matchMap, status]);
+  }, [pdfDoc, pageNum, scale, matchMap, status, focusClauseIndex, clauses]);
 
   const pageHits  = matchMap[pageNum] || [];
   const totalHits = Object.values(matchMap).flat().length;
@@ -438,20 +452,10 @@ function ClauseReviewCard({ clause, index, decision, onDecide, onRequestChange, 
     const updated = [...localChat, { role:'user', content:userMsg }];
     setLocalChat(updated);
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST', headers: { 'Content-Type':'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514', max_tokens: 1000,
-          system: `You are a contract law assistant. Clause: ${clause.clause_title}. Original text: ${clause.original_text}. Proposed alternate: ${clause.alternate_clause}. Respond in 2-4 plain sentences. If asked to rewrite, prefix your rewritten clause with exactly: REVISED_CLAUSE:`,
-          messages: updated.map(m => ({ role:m.role, content:m.content })),
-        }),
-      });
-      const data  = await res.json();
-      const reply = (data.content || []).map(b => b.text || '').join('');
+      const reply = await onRequestChange(index, userMsg, updated);
       const newHistory = [...updated, { role:'assistant', content:reply }];
       setLocalChat(newHistory);
-      const match = reply.match(/REVISED_CLAUSE:\s*([\s\S]+)/);
-      onRequestChange(index, match ? match[1].trim() : null, newHistory);
+      onRequestChange(index, null, newHistory);
     } catch {
       setLocalChat(prev => [...prev, { role:'assistant', content:'Connection error. Please try again.' }]);
     }
@@ -634,6 +638,7 @@ export default function App() {
   const [file,             setFile]             = useState(null);
   const [loading,          setLoading]          = useState(false);
   const [data,             setData]             = useState(null);
+  const [sessionId,        setSessionId]        = useState('');
   const [guardrailErrors,  setGuardrailErrors]  = useState([]);
   const [pageReady,        setPageReady]        = useState(false);
   const [decisions,        setDecisions]        = useState({});
@@ -648,28 +653,127 @@ export default function App() {
   useEffect(() => { setPageReady(true); }, []);
   useEffect(() => { if (showFinalDoc) finalDocRef.current?.scrollIntoView({ behavior:'smooth' }); }, [showFinalDoc]);
 
-  async function handleUpload() {
-    if (!file) return;
-    setLoading(true); setDecisions({}); setChatRevisions({}); setChatHistories({}); setShowFinalDoc(false);
-    await new Promise(r => setTimeout(r, 1600));
-    const raw       = mockBackendResponse(file.name); // ← swap for real API call
-    const validated = validateResponse(raw);
-    if (!validated || validated._errors) { setGuardrailErrors(validated?._errors || ['Unknown error']); setData(null); }
-    else                                 { setGuardrailErrors([]); setData(validated); }
-    setLoading(false);
+  function applyReviewResponse(raw) {
+    const mapped = mapReviewResponse(raw);
+    if (!mapped) {
+      setGuardrailErrors(['Invalid review response from backend']);
+      setData(null);
+      return;
+    }
+
+    const validated = validateResponse(mapped);
+    if (!validated || validated._errors) {
+      setGuardrailErrors(validated?._errors || ['Unknown validation error']);
+      setData(null);
+      return;
+    }
+
+    setSessionId(mapped.session_id || sessionId);
+    setData(mapped);
+    setGuardrailErrors([]);
+
+    const synced = {};
+    mapped.clauses.forEach((clause, idx) => {
+      const decision = statusToDecision(clause.status);
+      if (decision) synced[idx] = decision;
+    });
+    setDecisions(synced);
   }
 
-  function handleDecide(i, dec) { setDecisions(p => ({ ...p, [i]: p[i]===dec ? undefined : dec })); }
-  function handleRequestChange(i, rev, hist) {
-    if (rev)  setChatRevisions(p => ({ ...p, [i]: rev }));
-    if (hist) setChatHistories(p => ({ ...p, [i]: hist }));
+  async function handleUpload() {
+    if (!file) return;
+    setLoading(true);
+    setSessionId('');
+    setDecisions({});
+    setChatRevisions({});
+    setChatHistories({});
+    setShowFinalDoc(false);
+
+    try {
+      const lowerName = file.name.toLowerCase();
+      let response;
+
+      if (lowerName.endsWith('.pdf')) {
+        const formData = new FormData();
+        formData.append('file', file);
+        response = await fetch(`${API_BASE_URL}/review/analyze`, { method: 'POST', body: formData });
+      } else if (lowerName.endsWith('.txt')) {
+        const text = await file.text();
+        response = await fetch(`${API_BASE_URL}/review/analyze-text`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ document_name: file.name, text }),
+        });
+      } else {
+        throw new Error('Use a .pdf for full review, or .txt for text-only testing.');
+      }
+
+      const raw = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(raw?.detail || 'Backend analyze failed.');
+      applyReviewResponse(raw);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown upload error';
+      setGuardrailErrors([msg]);
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
   }
+
+  async function handleDecide(i, dec) {
+    if (!data || !sessionId || !data.clauses[i]) return;
+    const clause = data.clauses[i];
+    const decision = dec === 'approved' ? 'accept' : 'decline';
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/review/${sessionId}/clauses/${clause.clause_id}/decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      });
+      const raw = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(raw?.detail || 'Could not apply decision');
+      applyReviewResponse(raw);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Decision update failed';
+      setGuardrailErrors([msg]);
+    }
+  }
+
+  async function handleRequestChange(i, instruction, hist) {
+    if (hist) setChatHistories(p => ({ ...p, [i]: hist }));
+    if (!instruction || !instruction.trim()) return '';
+    if (!data || !sessionId || !data.clauses[i]) return 'Session not ready yet.';
+
+    const clause = data.clauses[i];
+    try {
+      const response = await fetch(`${API_BASE_URL}/review/${sessionId}/clauses/${clause.clause_id}/suggest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instruction }),
+      });
+      const raw = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(raw?.detail || 'Could not generate suggestion');
+      applyReviewResponse(raw);
+
+      const updatedClause = (mapReviewResponse(raw)?.clauses || []).find(c => c.clause_id === clause.clause_id);
+      if (updatedClause?.alternate_clause) {
+        setChatRevisions(p => ({ ...p, [i]: updatedClause.alternate_clause }));
+      }
+      return updatedClause?.improvement_reason || 'Suggestion generated and ready for review.';
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Suggestion request failed';
+      setGuardrailErrors([msg]);
+      return 'I could not update this clause right now. Please try again.';
+    }
+  }
+
   function handleViewInPdf(i) { setFocusClauseIndex(i); setShowPdf(true); }
 
   const totalAlternates = data ? data.clauses.filter(c => c.alternate_clause).length : 0;
-  const reviewedCount   = Object.keys(decisions).length + Object.keys(chatRevisions).length;
+  const reviewedCount   = data ? data.clauses.filter(c => c.status === 'accepted' || c.status === 'declined').length : 0;
   const allReviewed     = totalAlternates > 0 && reviewedCount >= totalAlternates;
-  const approvedCount   = Object.values(decisions).filter(d => d==='approved').length;
+  const approvedCount   = data ? data.clauses.filter(c => c.status === 'accepted').length : 0;
   const chatModCount    = Object.values(chatRevisions).filter(Boolean).length;
 
   function generateFinalDoc() { setFinalDoc(buildFinalDocument(data, decisions, chatRevisions)); setShowFinalDoc(true); }
@@ -679,6 +783,102 @@ export default function App() {
     const a    = document.createElement('a'); a.href = url;
     a.download = `${data.document_name.replace(/\.[^.]+$/,'')}_reviewed.txt`;
     a.click(); URL.revokeObjectURL(url);
+  }
+
+  async function downloadPdfFromReview({ highlighted }) {
+    if (!data) return;
+    const pdf = await PDFDocument.create();
+    const font = await pdf.embedFont(StandardFonts.Helvetica);
+    const fontBold = await pdf.embedFont(StandardFonts.HelveticaBold);
+    const page = pdf.addPage([595, 842]); // A4 portrait in points
+
+    const margin = 40;
+    const lineHeight = 16;
+    let y = 800;
+
+    function ensurePageSpace(linesNeeded = 1) {
+      if (y - linesNeeded * lineHeight < 60) {
+        const next = pdf.addPage([595, 842]);
+        y = 800;
+        return next;
+      }
+      return null;
+    }
+
+    let currentPage = page;
+    const drawLine = (text, opts = {}) => {
+      const nextPage = ensurePageSpace(1);
+      if (nextPage) currentPage = nextPage;
+      currentPage.drawText(text, {
+        x: margin,
+        y,
+        size: opts.size || 11,
+        font: opts.bold ? fontBold : font,
+        color: opts.color || rgb(0.12, 0.16, 0.22),
+      });
+      y -= opts.lineHeight || lineHeight;
+    };
+
+    const wrap = (txt, maxChars = 95) => {
+      const words = (txt || '').split(' ');
+      const lines = [];
+      let cur = '';
+      words.forEach(word => {
+        const cand = cur ? `${cur} ${word}` : word;
+        if (cand.length > maxChars) {
+          if (cur) lines.push(cur);
+          cur = word;
+        } else {
+          cur = cand;
+        }
+      });
+      if (cur) lines.push(cur);
+      return lines;
+    };
+
+    drawLine(`CONTRACT REVIEW PDF — ${data.document_name}`, { bold: true, size: 14, lineHeight: 22 });
+    drawLine(`Overall Risk: ${data.overall_risk}`, { bold: true });
+    drawLine(`Generated: ${new Date().toLocaleString()}`);
+    y -= 8;
+
+    data.clauses.forEach((clause, idx) => {
+      const risk = clause.risk_level;
+      const finalText = chatRevisions[idx]
+        || (decisions[idx] === 'approved' && clause.alternate_clause ? clause.alternate_clause : clause.original_text);
+
+      const nextPage = ensurePageSpace(5);
+      if (nextPage) currentPage = nextPage;
+
+      if (highlighted && (risk === 'High' || risk === 'Medium')) {
+        const boxColor = risk === 'High' ? rgb(1, 0.92, 0.92) : rgb(1, 0.97, 0.86);
+        currentPage.drawRectangle({
+          x: margin - 6,
+          y: y - 8,
+          width: 520,
+          height: 22,
+          color: boxColor,
+          borderColor: risk === 'High' ? rgb(0.86, 0.16, 0.16) : rgb(0.78, 0.53, 0.06),
+          borderWidth: 1,
+        });
+      }
+
+      drawLine(`${idx + 1}. ${clause.clause_title} (${risk})`, { bold: true, lineHeight: 20 });
+      drawLine(`Status: ${decisions[idx] === 'approved' ? 'APPROVED' : decisions[idx] === 'denied' ? 'DECLINED' : 'PENDING'}`, {
+        color: rgb(0.39, 0.45, 0.55),
+      });
+      wrap(finalText, 95).forEach(line => drawLine(line));
+      y -= 8;
+    });
+
+    const bytes = await pdf.save();
+    const blob = new Blob([bytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const suffix = highlighted ? 'highlighted_review' : 'revised_review';
+    a.href = url;
+    a.download = `${data.document_name.replace(/\\.[^.]+$/, '')}_${suffix}.pdf`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   return (
@@ -752,8 +952,8 @@ export default function App() {
                 <Upload size={30} color="#2563EB" strokeWidth={1.5}/>
               </div>
               <h2 style={{ fontSize:21, fontWeight:800, margin:'0 0 6px' }}>Upload your document</h2>
-              <p style={{ color:'#94A3B8', fontSize:13, fontWeight:500, margin:'0 0 22px' }}>PDF, DOCX · Up to 50MB</p>
-              <input type="file" id="pdf-upload" style={{ display:'none' }} onChange={e => setFile(e.target.files[0])} accept=".pdf,.docx"/>
+              <p style={{ color:'#94A3B8', fontSize:13, fontWeight:500, margin:'0 0 22px' }}>PDF or TXT · Up to 50MB</p>
+              <input type="file" id="pdf-upload" style={{ display:'none' }} onChange={e => setFile(e.target.files[0])} accept=".pdf,.txt"/>
               {!file ? (
                 <label htmlFor="pdf-upload" style={{ display:'inline-flex', alignItems:'center', gap:7, background:'#2563EB', color:'#fff', borderRadius:11, padding:'10px 24px', fontWeight:700, fontSize:14, cursor:'pointer' }}>
                   <Upload size={15}/> Choose File
@@ -918,6 +1118,8 @@ export default function App() {
                     <span style={{ fontWeight:700, color:'#fff', fontSize:14 }}>Final Document — {data.document_name.replace(/\.[^.]+$/,'')}_reviewed.txt</span>
                   </div>
                   <div style={{ display:'flex', gap:7 }}>
+                    <button onClick={() => downloadPdfFromReview({ highlighted:true })} style={{ display:'flex', alignItems:'center', gap:5, background:'#DBEAFE', color:'#1E40AF', border:'none', borderRadius:7, padding:'5px 11px', fontWeight:700, fontSize:12, cursor:'pointer' }}><Download size={12}/> Highlighted PDF</button>
+                    <button onClick={() => downloadPdfFromReview({ highlighted:false })} style={{ display:'flex', alignItems:'center', gap:5, background:'#E0F2FE', color:'#0C4A6E', border:'none', borderRadius:7, padding:'5px 11px', fontWeight:700, fontSize:12, cursor:'pointer' }}><Download size={12}/> Revised PDF</button>
                     <button onClick={downloadDoc} style={{ display:'flex', alignItems:'center', gap:5, background:'#fff', color:'#2563EB', border:'none', borderRadius:7, padding:'5px 13px', fontWeight:700, fontSize:12, cursor:'pointer' }}><Download size={12}/> Download</button>
                     <button onClick={() => setShowFinalDoc(false)} style={{ background:'rgba(255,255,255,0.15)', border:'none', color:'#fff', borderRadius:7, padding:'5px 8px', cursor:'pointer' }}><X size={14}/></button>
                   </div>
@@ -940,7 +1142,10 @@ export default function App() {
                 </div>
                 <div style={{ background:'#F8FAFC', padding:'10px 17px', borderTop:'1px solid #E2E8F0', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
                   <span style={{ fontSize:11, color:'#94A3B8' }}>⚠ For review purposes only. Not legal advice.</span>
-                  <button onClick={downloadDoc} style={{ display:'flex', alignItems:'center', gap:5, background:'#2563EB', color:'#fff', border:'none', borderRadius:7, padding:'6px 15px', fontWeight:700, fontSize:12, cursor:'pointer' }}><Download size={12}/> Save .txt</button>
+                  <div style={{ display:'flex', gap:7 }}>
+                    <button onClick={downloadDoc} style={{ display:'flex', alignItems:'center', gap:5, background:'#2563EB', color:'#fff', border:'none', borderRadius:7, padding:'6px 15px', fontWeight:700, fontSize:12, cursor:'pointer' }}><Download size={12}/> Save .txt</button>
+                    <button onClick={() => downloadPdfFromReview({ highlighted:false })} style={{ display:'flex', alignItems:'center', gap:5, background:'#0EA5E9', color:'#fff', border:'none', borderRadius:7, padding:'6px 15px', fontWeight:700, fontSize:12, cursor:'pointer' }}><Download size={12}/> Save .pdf</button>
+                  </div>
                 </div>
               </div>
             )}

@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 from app.routes.analyze import router as analyze_router
+from app.routes.review import router as review_router
 
 
 load_dotenv()
@@ -42,3 +43,4 @@ def health() -> dict[str, str]:
 
 
 app.include_router(analyze_router)
+app.include_router(review_router)
